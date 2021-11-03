@@ -1,0 +1,713 @@
+const n = require('NeteaseCloudMusicApi');
+const fs = require('fs');
+const { SlashCommandBuilder } = require('@discordjs/builders');
+const {
+    MessageEmbed,
+    MessageActionRow,
+    MessageButton
+} = require("discord.js");
+const {
+    createAudioPlayer,
+    createAudioResource,
+    joinVoiceChannel,
+    AudioPlayerStatus,
+    entersState,
+    StreamType
+} = require('@discordjs/voice');
+let check;
+const ytdl = require('ytdl-core');
+const axios = require('axios');
+const { dev } = require("../../config.json");
+
+module.exports = {
+    data: new SlashCommandBuilder()
+        .setName('music')
+        .setDefaultPermission(!dev)
+        .setDescription('請輸入音樂網址\n目前支援 網易雲音樂 與 YouTube 的網址')
+        .addStringOption(option =>
+            option.setName('網址')
+                .setDescription('請輸入音樂網址\n目前支援 網易雲音樂 與 YouTube 的網址')
+                .setRequired(true)),
+    async run(client, interaction) {
+
+        const voiceChannel = interaction.member.voice.channel;
+
+        if (!voiceChannel) return await interaction.reply({ content: '你不在語音頻道哦', ephemeral: true });
+        const url = interaction.options.getString('網址');
+
+        if ((!url.startsWith('https://music.163.com/') && !url.includes('song?id=')) && (!url.match(/(youtube.com|youtu.be)\/(watch)?(\?v=)?(\S+)?/))) return await interaction.reply({ content: '目前僅支援 網易雲音樂 與 YouTube 的網址哦', ephemeral: true });
+
+        if (url.match(/(youtube.com|youtu.be)\/(watch)?(\?v=)?(\S+)?/)) {
+            const songInfo = await ytdl.getInfo(url);
+            if (!songInfo) return await interaction.reply({ content: '沒有找到這首歌哦', ephemeral: true });
+            if (!songInfo.videoDetails.media.song) return yt_music(interaction, client, songInfo);
+
+            await n.cloudsearch({
+                keywords: songInfo.videoDetails.media.song
+            }).then(async s_data => {
+                if (!s_data.body.result.songCount) return yt_music(interaction, client, songInfo);
+                check = true;
+
+                await n.song_url({
+                    id: s_data.body.result.songs[0].id.toString(),
+                    //cookie: result.body.cookie
+                }).then(data => {
+                    if (data.body.data[0].freeTrialInfo || !data.body.data[0].url) return check = false;
+                });
+
+                if (!check) return yt_music(interaction, client, songInfo);
+
+                await n.song_detail({
+                    ids: s_data.body.result.songs[0].id.toString()
+                }).then(async data => {
+                    let ar_name = '';
+                    const music_data = data.body.songs[0];
+                    let mm = Math.floor(music_data.dt / 60000);
+                    let ss = Math.floor(music_data.dt % 60000 / 1000);
+
+                    music_data.ar.forEach((ar, i) => {
+                        if (i === music_data.ar.length - 1) ar_name += ar.name;
+                        else ar_name += ar.name + '/';
+                    });
+                    const row = new MessageActionRow()
+                        .addComponents(
+                            new MessageButton()
+                                .setCustomId('確認')
+                                .setLabel('確認')
+                                .setEmoji('✅')
+                                .setStyle('SUCCESS'),
+                        )
+                        .addComponents(
+                            new MessageButton()
+                                .setCustomId('取消')
+                                .setLabel('取消')
+                                .setEmoji('❌')
+                                .setStyle('DANGER'),
+                        );
+
+                    const embed = new MessageEmbed()
+                        .setTitle('為你在網易雲找到相似歌曲')
+                        .setDescription(`**${ar_name} - ${music_data.name}**\n\n【${music_data.al.name}】\n\n是否改為播放這首歌?`)
+                        .setThumbnail(music_data.al.picUrl)
+                        .setFooter(`${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+                        .setColor("RANDOM");
+
+                    await interaction.reply({ embeds: [embed], ephemeral: false, components: [row] });
+
+                    const filter = i => {
+                        return ['確認', '取消'].includes(i.customId) && i.user.id === interaction.user.id;
+                    };
+
+                    //const filter = i => i.user.id === interaction.user.id;
+                    interaction.channel.awaitMessageComponent({ filter, time: 8000 })
+                        .then(i => {
+                            if (i.customId === '確認') nt_music(interaction, client, `https://music.163.com/#/song?id=${s_data.body.result.songs[0].id}`, true);
+                            else if (i.customId === '取消') yt_music(interaction, client, songInfo, true);
+                        })
+                        .catch(() => yt_music(interaction, client, songInfo, true));
+                });
+
+            });
+
+        } else nt_music(interaction, client, url);
+
+    },
+    async play_music(client, interaction) {
+        play_music(client, interaction);
+    }
+
+};
+
+async function yt_music(interaction, client, songInfo, yt_to_nt) {
+    let loading = false;
+    let msg = '已加入播放列表:';
+    const voiceChannel = interaction.member.voice.channel;
+
+    let music_data = songInfo.videoDetails;
+    let re = client.music.find(m => m.music_id === music_data.videoId);
+    if (music_data.isLiveContent) return await interaction.reply({ content: '暫不支持直播中的影片哦', ephemeral: true });
+
+    let dt = parseInt(music_data.lengthSeconds);
+    let mm = Math.floor(dt / 60);
+    let ss = Math.floor(dt % 60);
+
+    client.music.push({
+        music_id: music_data.videoId,
+        music_name: music_data.title,
+        music_cover_url: music_data.thumbnails[music_data.thumbnails.length - 1].url,
+        music_url: music_data.video_url,
+        music_album_name: music_data.author.name,
+        music_artist_name: music_data.author.name,
+        music_dt: dt * 1000,
+        now_time: 0,
+        lyc_delay: 0,
+        uid: interaction.user.id,
+        rep: false,
+        youtube: true,
+        stop_vote: [],
+        skip_vote: [],
+        dts: true,
+        write: false
+    });
+
+    if (client.music.length <= 1) {
+        loading = true;
+        msg = '開始緩衝歌曲:';
+    }
+    const embed = new MessageEmbed()
+        .setTitle(msg)
+        .setDescription(`**[${music_data.title}](${music_data.video_url})**\n\n【${music_data.author.name}】`)
+        .setThumbnail(music_data.thumbnails[music_data.thumbnails.length - 1].url)
+        .setFooter(`${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+        .setColor("RANDOM");
+
+    if (yt_to_nt) await interaction.editReply({ embeds: [embed], ephemeral: false, components: [] });
+    else await interaction.reply({ embeds: [embed], ephemeral: false });
+
+    if (re) client.music[client.music.length - 1].write = true;
+
+    if (!re) ytdl(music_data.video_url, { quality: 'highestaudio', filter: 'audioonly', dlChunkSize: 0 })
+        .pipe(fs.createWriteStream(`./music/${music_data.videoId}.webm`))
+        .once("finish", async () => {
+            if (loading) {
+                const cembed = new MessageEmbed()
+                    .setDescription(`✅緩衝完成`)
+                    .setColor("GREEN");
+                await interaction.followUp({ embeds: [cembed], ephemeral: false });
+                client.player = createAudioPlayer();
+                client.connection = joinVoiceChannel({
+                    channelId: voiceChannel.id,
+                    guildId: voiceChannel.guild.id,
+                    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                });
+                play_music(client, interaction);
+            }
+            let write = client.music.find(m => m.music_id === music_data.videoId);
+
+            write.write = true;
+        });
+
+}
+
+async function nt_music(interaction, client, url, yt_to_nt) {
+    let music_id = '';
+    let loading = false;
+    let msg = '已加入播放列表:';
+    const voiceChannel = interaction.member.voice.channel;
+
+    if (url.includes('/#/')) music_id = url.split('https://music.163.com/#/song?id=').slice(1)[0].split('&')[0];
+    else music_id = url.split('https://music.163.com/song?id=').slice(1)[0].split('&')[0];
+
+    if (isNaN(Math.floor(music_id))) return await interaction.reply({ content: '沒有找到這首歌哦', ephemeral: true });
+
+    check = true;
+
+    await n.song_url({
+        id: music_id,
+        //cookie: result.body.cookie
+    }).then(data => {
+        if (data.body.data[0].freeTrialInfo || !data.body.data[0].url) check = false;
+    });
+
+    if (!check) return await interaction.reply({ content: '此音樂暫不可用\n原因:暫無版權或僅供VIP用戶聆聽', ephemeral: true });
+
+    let re = client.music.find(m => m.music_id === music_id);
+
+    n.song_detail({
+        ids: music_id
+    }).then(async data => {
+        //console.log(data.body.songs[0]);
+        const music_data = data.body.songs[0];
+        let mm = Math.floor(music_data.dt / 60000);
+        let ss = Math.floor(music_data.dt % 60000 / 1000);
+        let ar_name = '';
+        music_data.ar.forEach((ar, i) => {
+            if (i === music_data.ar.length - 1) ar_name += ar.name;
+            else ar_name += ar.name + '/';
+        });
+
+        let queue = {
+            music_id: music_id,
+            music_name: music_data.name,
+            music_cover_url: music_data.al.picUrl,
+            music_album_name: music_data.al.name,
+            music_artist_name: ar_name,
+            music_dt: music_data.dt,
+            music_url: url,
+            now_time: 0,
+            uid: interaction.user.id,
+            stop_vote: [],
+            skip_vote: [],
+            lyc_delay: 0,
+            youtube: false,
+            rep: false,
+            dts: true,
+            write: false
+        }
+
+        n.lyric({
+            id: queue.music_id
+        }).then(ly => {
+
+            if (ly.body.nolyric) return;
+
+            queue.lyric = ly.body.lrc.lyric.split('\n');
+            queue.lyric.splice(queue.lyric.length - 1, 1);
+
+            queue.lyric_check = true;
+            let ly2 = '(結束)'
+            for (let i = 1; i < 100; i++) {
+                if (queue.lyric[i].split(']')[1].length !== 0) {
+                    ly2 = queue.lyric[i].split(']')[1];
+                    break;
+                }
+            }
+
+            queue.lyc_embed = {
+                e1: `**${queue.lyric[0].split(']')[1]}**`,
+                e2: ly2
+            }
+
+            if (ly.body.tlyric.version) {
+                queue.chinese_lyric = ly.body.tlyric.lyric.split('\n');
+                queue.chinese_lyric.splice(queue.chinese_lyric.length - 1, 1);
+                queue.chinese_lyric.splice(0, 1);
+
+                queue.chinese_lyric_check = true;
+                let ly2 = '(結束)'
+                for (let i = 1; i < 100; i++) {
+                    if (queue.chinese_lyric[i].split(']')[1].length !== 0) {
+                        ly2 = queue.chinese_lyric[i].split(']')[1];
+                        break;
+                    }
+                }
+                let che1 = queue.chinese_lyric[0].split(']')[1]
+                if (!che1) che1 = queue.lyric[0].split(']')[1]
+
+                queue.lyc_embed.che1 = che1;
+                queue.lyc_embed.che2 = ly2;
+            }
+
+        });
+
+
+        client.music.push(queue);
+
+        if (client.music.length <= 1) {
+            loading = true;
+            msg = '開始緩衝歌曲:';
+        } else client.music[client.music.length - 1].message_id = client.music[0].message_id
+
+        const embed = new MessageEmbed()
+            .setTitle(msg)
+            .setDescription(`**[${ar_name} - ${music_data.name}](${url})**\n\n【${music_data.al.name}】`)
+            .setThumbnail(music_data.al.picUrl)
+            .setFooter(`${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+            .setColor("RANDOM");
+
+        if (yt_to_nt) await interaction.editReply({ embeds: [embed], ephemeral: false, components: [] });
+        else await interaction.reply({ embeds: [embed], ephemeral: false });
+
+        if (re) client.music[client.music.length - 1].write = true;
+
+        const result = await n.login({
+            email: 'henry27161433@126.com',
+            password: 'henry88118'
+        });
+
+        if (!re) n.song_url({
+            id: music_id,
+            //cookie: result.body.cookie
+        }).then(async data => {
+
+            let url = data.body.data[0].url;
+
+            const response = await axios({
+                url,
+                method: 'GET',
+                responseType: 'stream'
+            })
+
+            response.data.pipe(fs.createWriteStream(`./music/${music_id}.mp3`))
+                .once('finish', async () => {
+                    if (loading) {
+                        const cembed = new MessageEmbed()
+                            .setDescription(`✅緩衝完成`)
+                            .setColor("GREEN");
+                        await interaction.followUp({ embeds: [cembed], ephemeral: false });
+                        client.player = createAudioPlayer();
+                        client.connection = joinVoiceChannel({
+                            channelId: voiceChannel.id,
+                            guildId: voiceChannel.guild.id,
+                            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                        });
+                        play_music(client, interaction);
+                    }
+                    let write = client.music.find(m => m.music_id === queue.music_id);
+
+                    write.write = true;
+                });
+        });
+
+    });
+
+}
+
+function time(client, interaction, time_data) {
+    let rep = '';
+    const channel = interaction.guild.channels.cache.find(ch => ch.name === '🎵歌詞顯示區');
+
+    const t = setTimeout(() => {
+        const music = client.music[0];
+        if (!music) return;
+        if (client.player_timer_skip) return client.player_timer_skip = false;
+        music.now_time++;
+        let now_mm = Math.floor(music.now_time / 60);
+        let now_ss = music.now_time % 60;
+
+        if (music.lyric_check) {
+            let mm = Math.floor(music.music_dt / 60000);
+            let ss = Math.floor(music.music_dt % 60000 / 1000);
+
+            let o_lyric = music.lyric.find(l => {
+                let t = l.split(']').slice(0)[0].split('[')[1].split(':');
+                let cm = parseInt(t[0]) * 60;
+                let cs = cm + parseInt(t[1]);
+                if (cs === music.now_time + music.lyc_delay && l.split(']')[1].length !== 0) return l;
+            });
+
+            if (o_lyric) {
+                let o_time = o_lyric.split(']').slice(0)[0].split('[')[1].split(':');
+                let o_c_mm = parseInt(o_time[0]) * 60;
+                let o_c_ss = o_c_mm + parseInt(o_time[1]);
+
+                if (o_c_ss === music.now_time + music.lyc_delay && o_lyric.split(']')[1].length !== 0) {
+                    let ly2 = '(結束)'
+                    let ch_ly2 = '(結束)'
+
+                    music.lyric.find((l, i) => {
+                        let o_time2 = l.split(']').slice(0)[0].split('[')[1].split(':');
+                        let o_c_mm2 = parseInt(o_time2[0]) * 60;
+                        let o_c_ss2 = o_c_mm2 + parseInt(o_time2[1]);
+
+                        if (o_c_ss2 === music.now_time + music.lyc_delay && l.split(']')[1].length !== 0) for (let o = 1; o < 100; o++) {
+                            if (music.lyric[i + o])
+                                if (music.lyric[i + o].split(']')[1].length !== 0) {
+                                    ly2 = music.lyric[i + o].split(']')[1];
+                                    break;
+                                }
+                        }
+                    });
+
+                    let embed_fields = ({
+                        name: `**${o_lyric.split(']')[1]}**`,
+                        value: ly2
+                    })
+
+                    if (music.chinese_lyric_check) {
+
+                        let ch_lyric = music.chinese_lyric.find(l => {
+                            let t = l.split(']').slice(0)[0].split('[')[1].split(':');
+                            let cm = parseInt(t[0]) * 60;
+                            let cs = cm + parseInt(t[1]);
+                            if (cs === music.now_time + music.lyc_delay && l.split(']')[1].length !== 0) return l;
+                        });
+
+                        if (ch_lyric) {
+
+                            music.chinese_lyric.find((l, i) => {
+                                let ch_time = l.split(']').slice(0)[0].split('[')[1].split(':');
+                                let ch_c_mm = parseInt(ch_time[0]) * 60;
+                                let ch_c_ss = ch_c_mm + parseInt(ch_time[1]);
+                                if (ch_c_ss === music.now_time + music.lyc_delay && l.split(']')[1].length !== 0)
+                                    for (let o = 1; o < 100; o++) {
+                                        if (music.chinese_lyric[i + o])
+                                            if (music.chinese_lyric[i + o].split(']')[1].length !== 0) {
+                                                ch_ly2 = music.chinese_lyric[i + o].split(']')[1];
+                                                break;
+                                            }
+                                    }
+                            });
+
+                            embed_fields = [{
+                                name: `**${o_lyric.split(']')[1]}**`,
+                                value: `**${ch_lyric.split(']')[1]}**`
+                            },
+                            {
+                                name: ly2,
+                                value: ch_ly2
+                            }];
+                            time_data.chly1 = `**${ch_lyric.split(']')[1]}**`;
+                            time_data.chly2 = ch_ly2;
+                        } else {
+                            embed_fields = [{
+                                name: `**${o_lyric.split(']')[1]}**`,
+                                value: `**${o_lyric.split(']')[1]}**`
+                            },
+                            {
+                                name: ly2,
+                                value: ly2
+                            }];
+                        }
+
+                    }
+
+
+                    time_data.ly1 = `**${o_lyric.split(']')[1]}**`;
+                    time_data.ly2 = ly2;
+
+                    if (music.rep) rep = '🔂'
+
+                    const lembed = new MessageEmbed()
+                        .setTitle(`**${music.music_artist_name} - ${music.music_name}**`)
+                        .setURL(music.music_url)
+                        .setDescription(`【${music.music_album_name}】`)
+                        .setThumbnail(music.music_cover_url)
+                        .addFields(embed_fields)
+                        .setFooter(`${now_mm.toString().padStart(2, '0')}:${now_ss.toString().padStart(2, '0')} / ${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')} ${rep}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+                        .setColor("RANDOM");
+
+                    channel.messages.fetch(client.player_message_id).then(m => {
+                        m.edit({ embeds: [lembed] });
+                    });
+                    music.dts = true;
+                }
+
+            } else if (!o_lyric && music.dts) {
+                if (client.music[0].rep) rep = '🔂'
+
+                let embed_fields = ({
+                    name: time_data.ly1,
+                    value: time_data.ly2
+                })
+
+                if (music.chinese_lyric_check) embed_fields = [{
+                    name: time_data.ly1,
+                    value: time_data.chly1
+                },
+                {
+                    name: time_data.ly2,
+                    value: time_data.chly2
+                }];
+
+                const lembed = new MessageEmbed()
+                    .setTitle(`**${music.music_artist_name} - ${music.music_name}**`)
+                    .setURL(music.music_url)
+                    .setDescription(`【${music.music_album_name}】`)
+                    .setThumbnail(music.music_cover_url)
+                    .addFields(embed_fields)
+                    .setFooter(`${now_mm.toString().padStart(2, '0')}:${now_ss.toString().padStart(2, '0')} / ${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')} ${rep}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+                    .setColor("RANDOM");
+
+                channel.messages.fetch(client.player_message_id).then(m => {
+                    m.edit({ embeds: [lembed] });
+                });
+            }
+        } else {
+            if (music.dts) {
+                let mm = Math.floor(music.music_dt / 60000);
+                let ss = Math.floor(music.music_dt % 60000 / 1000);
+                if (client.music[0].rep) rep = '🔂'
+                const lembed = new MessageEmbed()
+                    .setTitle(`**${music.music_artist_name} - ${music.music_name}**`)
+                    .setURL(music.music_url)
+                    .setDescription(`【${music.music_album_name}】`)
+                    .setThumbnail(music.music_cover_url)
+                    .setFooter(`${now_mm.toString().padStart(2, '0')}:${now_ss.toString().padStart(2, '0')} / ${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')} ${rep}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+                    .setColor("RANDOM");
+
+                channel.messages.fetch(client.player_message_id).then(m => {
+                    m.edit({ embeds: [lembed] });
+                });
+            }
+        }
+        music.dts = !music.dts;
+        if (client.player_timer_stop) {
+            client.player_timer_stop = false;
+            if (music.rep) client.music[0].now_time = 0;
+        } else time(client, interaction, time_data);
+    }, 1000);
+    return t;
+}
+
+
+async function play_music(client, interaction) {
+
+    const player = client.player;
+    const connection = client.connection;
+    const channel = interaction.guild.channels.cache.find(ch => ch.name === '🎵歌詞顯示區');
+    const music = client.music[0];
+
+    if (!music) {
+        player.stop();
+        connection.destroy();
+        delete client.player
+        channel.messages.fetch(client.player_message_id).then(m => m.delete());
+        channel.messages.fetch(client.player_ly_time_id).then(m => m.delete());
+        delete client.player_message_id;
+        fs.readdirSync(`./music/`).forEach(mf => {
+            try {
+                fs.unlinkSync(`./music/${mf}`);
+            } catch (err) {
+                console.log(`無法移除./music/${mf}`);
+            }
+        });
+        return client.user.setPresence({
+            status: 'online',
+            activities: [{
+                name: '鳴鈴の窩',
+                type: 'WATCHING'
+            }]
+        });
+    }
+
+    const row = new MessageActionRow()
+        .addComponents(
+            new MessageButton()
+                .setCustomId('停止播放')
+                .setLabel('停止播放')
+                .setEmoji('⏹')
+                .setStyle('PRIMARY'),
+        )
+        .addComponents(
+            new MessageButton()
+                .setCustomId('下一首')
+                .setLabel('下一首')
+                .setEmoji('⏭')
+                .setStyle('PRIMARY'),
+        )
+        .addComponents(
+            new MessageButton()
+                .setCustomId('單曲循環')
+                .setLabel('單曲循環')
+                .setEmoji('🔂')
+                .setStyle('PRIMARY'),
+        )
+        .addComponents(
+            new MessageButton()
+                .setCustomId('列隊一覽')
+                .setLabel('列隊一覽')
+                .setEmoji('🎶')
+                .setStyle('PRIMARY'),
+        );
+
+    let mm = Math.floor(music.music_dt / 60000);
+    let ss = Math.floor(music.music_dt % 60000 / 1000);
+    let embed_fields;
+    let time_data = {
+        ly1: '無歌詞',
+        ly2: '無歌詞',
+        chly1: '無歌詞',
+        chly2: '無歌詞'
+    };
+
+    if (music.lyric_check) {
+        embed_fields = [{
+            name: music.lyc_embed.e1,
+            value: music.lyc_embed.e2
+        }]
+        if (music.chinese_lyric_check) embed_fields = [{
+            name: music.lyc_embed.e1,
+            value: music.lyc_embed.che1
+        },
+        {
+            name: music.lyc_embed.e2,
+            value: music.lyc_embed.che2
+        }];
+
+        time_data.ly1 = music.lyc_embed.e1;
+        time_data.ly2 = music.lyc_embed.e2;
+        time_data.chly1 = music.lyc_embed.che1;
+        time_data.chly2 = music.lyc_embed.che2;
+
+    } else embed_fields = {
+        name: '無歌詞',
+        value: '無歌詞'
+    }
+
+    const embed = new MessageEmbed()
+        .setTitle(`**${music.music_artist_name} - ${music.music_name}**`)
+        .setDescription(`【${music.music_album_name}】`)
+        .setThumbnail(music.music_cover_url)
+        .addFields(embed_fields)
+        .setFooter(`00:00 / ${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`, 'https://cdn.discordapp.com/attachments/730006359679959160/873409179002495038/playing.png')
+        .setColor("RANDOM");
+
+    if (client.player_message_id) channel.messages.fetch(client.player_message_id).then(m => {
+        m.edit({ embeds: [embed] });
+    });
+    else channel.send({ embeds: [embed], components: [row] }).then(m => {
+        client.player_message_id = m.id;
+    });
+
+    if (music.lyric_check) {
+        const row2 = new MessageActionRow()
+            .addComponents(
+                new MessageButton()
+                    .setCustomId('-1秒')
+                    .setLabel('-1秒')
+                    .setEmoji('⏪')
+                    .setStyle('PRIMARY'),
+            )
+            .addComponents(
+                new MessageButton()
+                    .setCustomId('還原')
+                    .setLabel('還原')
+                    .setEmoji('▶')
+                    .setStyle('PRIMARY'),
+            )
+            .addComponents(
+                new MessageButton()
+                    .setCustomId('+1秒')
+                    .setLabel('+1秒')
+                    .setEmoji('⏩')
+                    .setStyle('PRIMARY'),
+            )
+        const embed = new MessageEmbed()
+            .setDescription(`歌詞時間同步調整\n目前同步: 0`)
+            .setColor("BLUE");
+        if (client.player_ly_time_id) channel.messages.fetch(client.player_ly_time_id).then(m => {
+            m.edit({ embeds: [embed] });
+        });
+        else channel.send({ embeds: [embed], components: [row2] }).then(m => {
+            client.player_ly_time_id = m.id
+        });
+
+    }
+
+    const music_file = fs.readdirSync(`./music/`).find(mf => mf.includes(music.music_id));
+
+    let resource
+
+    if (!music.toutube) resource = createAudioResource(`./music/${music_file}`);
+    else resource = createAudioResource(`./music/${music_file}`, {
+        inputType: StreamType.WebmOpus
+    });
+
+    player.play(resource);
+
+    try {
+        await entersState(player, AudioPlayerStatus.Playing, 5000);
+        connection.subscribe(player);
+        time(client, interaction, time_data);
+        client.user.setPresence({
+            status: 'online',
+            activities: [{
+                name: music.music_name,
+                type: 'LISTENING'
+            }]
+        });
+    } catch (error) {
+        return console.error(error);
+    }
+
+    player.on('error', error => {
+        console.error(error);
+    });
+
+    player.on(AudioPlayerStatus.Idle, () => {
+        if (!music.rep) client.music.shift();
+        client.player_timer_stop = true;
+        play_music(client, interaction);
+    });
+}

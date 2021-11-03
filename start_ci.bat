@@ -1,0 +1,2 @@
+node ci.js
+pause
